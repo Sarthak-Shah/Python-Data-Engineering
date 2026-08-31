@@ -216,3 +216,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# --- this project -----------------------------------------------------------
+# The data lake and the warehouse are generated artefacts, never source control.
+data/lake/
+data/warehouse/
+!data/.gitkeep
+.venv/
+.venv*/

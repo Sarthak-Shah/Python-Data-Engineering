@@ -1,0 +1,7 @@
+# Extra packages layered on top of the official Airflow image.
+# Airflow itself is NOT listed here -- it comes from the base image, and pinning it
+# twice is the fastest way to break an Airflow install.
+duckdb==1.5.5
+pyarrow==25.0.1
+filelock==3.20.0
+paho-mqtt==2.1.0

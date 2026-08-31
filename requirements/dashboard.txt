@@ -1,0 +1,5 @@
+# Streamlit BI layer.
+-r pipeline.txt
+streamlit==1.62.0
+pandas==3.0.5
+requests==2.32.5
