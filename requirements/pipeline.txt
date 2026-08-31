@@ -1,0 +1,5 @@
+# Core pipeline dependencies -- shared by the ingestor, the simulator and Airflow.
+duckdb==1.5.5          # the embedded analytical warehouse (silver + gold)
+pyarrow==25.0.1        # writes the bronze Parquet files
+filelock==3.20.0       # serialises DuckDB writers across processes/containers
+paho-mqtt==2.1.0       # MQTT client for the streaming source

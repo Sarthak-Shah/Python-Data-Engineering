@@ -1,0 +1,22 @@
+# Streamlit BI layer.
+FROM python:3.11-slim
+
+# STREAMLIT_BROWSER_GATHER_USAGE_STATS=false keeps the container quiet and
+# offline-friendly; HOME must be writable because Streamlit caches config there.
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/app/src \
+    HOME=/tmp \
+    STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
+
+WORKDIR /app
+
+COPY requirements/ requirements/
+RUN pip install --no-cache-dir -r requirements/dashboard.txt
+
+COPY src/ src/
+COPY services/dashboard/ services/dashboard/
+
+EXPOSE 8501
+CMD ["streamlit", "run", "services/dashboard/app.py", \
+     "--server.address=0.0.0.0", "--server.port=8501", "--server.headless=true"]

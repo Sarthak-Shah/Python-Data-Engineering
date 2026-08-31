@@ -1,0 +1,4 @@
+# Development-only tools.  Installed into the utility `pipeline` image so that
+# `make test` works without a separate environment.
+-r pipeline.txt
+pytest==9.0.1

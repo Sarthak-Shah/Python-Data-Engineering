@@ -1,0 +1,16 @@
+# Airflow image = official image + this project's pipeline dependencies.
+#
+# We install only what the DAGs import.  Airflow itself, and its own pinned
+# dependency tree, come from the base image untouched.
+FROM apache/airflow:2.10.5-python3.11
+
+COPY requirements/airflow.txt /tmp/airflow-extra.txt
+
+# Must run as the `airflow` user: the official image refuses root pip installs,
+# and installing as root would put packages somewhere the runtime cannot see.
+USER airflow
+RUN pip install --no-cache-dir -r /tmp/airflow-extra.txt
+
+# The pipeline package is bind-mounted at /opt/airflow/src by docker-compose, so
+# DAG edits and pipeline edits both take effect without rebuilding this image.
+ENV PYTHONPATH=/opt/airflow/src

@@ -1,0 +1,259 @@
+# ---------------------------------------------------------------------------
+# The whole platform, as containers.
+#
+#   mosquitto        MQTT broker -- the streaming transport
+#   simulator        publishes live events + writes previous days' log files
+#   stream-ingestor  subscribes to MQTT and lands micro-batches in the lake
+#   postgres         Airflow's METADATA database (not the analytics warehouse!)
+#   airflow-*        scheduler + webserver running the two medallion DAGs
+#   api              FastAPI serving layer  -> http://localhost:8000/docs
+#   dashboard        Streamlit BI layer     -> http://localhost:8501
+#   pipeline         one-shot container for `docker compose run` tasks
+#
+# TWO DATABASES, DIFFERENT JOBS -- a distinction worth internalising:
+#   Postgres holds Airflow's own state (DAG runs, task history).  It is an OLTP
+#   database doing OLTP work.  DuckDB holds the analytics (silver + gold).  Never
+#   mix the two: an orchestrator that shares a database with the data it
+#   orchestrates cannot be restored, scaled or debugged independently.
+#
+# Start everything:   make up      (or: docker compose up -d --build)
+# ---------------------------------------------------------------------------
+
+x-pipeline-env: &pipeline-env
+  # Every component resolves its paths through these, via src/pipeline/config.py.
+  DATA_ROOT: /data
+  MQTT_HOST: mosquitto
+  MQTT_PORT: "1883"
+  MQTT_TOPIC: "logs/#"
+  LOG_LEVEL: INFO
+
+# All containers run as the same uid:gid so files on the shared /data volume stay
+# writable by every one of them.  `make init` writes AIRFLOW_UID=$(id -u) into
+# .env, which also makes the files readable from your host without sudo.
+x-run-as: &run-as
+  user: "${AIRFLOW_UID:-50000}:0"
+
+services:
+  # -------------------------------------------------------------------------
+  # STREAMING TRANSPORT
+  # -------------------------------------------------------------------------
+  mosquitto:
+    image: eclipse-mosquitto:2.0
+    container_name: medallion-mosquitto
+    ports:
+      - "1883:1883"        # publish/subscribe from your host too, e.g. mosquitto_pub
+    volumes:
+      - ./docker/mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - mosquitto-data:/mosquitto/data
+    healthcheck:
+      # The broker is only "healthy" once it is actually accepting connections;
+      # dependent containers wait for this instead of racing it.
+      test: ["CMD-SHELL", "timeout 2 mosquitto_sub -h localhost -t healthcheck -C 1 -W 1 || exit 0"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  # -------------------------------------------------------------------------
+  # SOURCES
+  # -------------------------------------------------------------------------
+  simulator:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.pipeline
+    container_name: medallion-simulator
+    <<: *run-as
+    environment:
+      <<: *pipeline-env
+      SIM_EVENTS_PER_SECOND: "5"
+      SIM_BACKFILL_DAYS: "3"
+      SIM_EVENTS_PER_BACKFILL_DAY: "5000"
+    # `--mode both` writes the backfill log files once, then streams forever.
+    command: ["python", "-m", "pipeline.simulator", "--mode", "both"]
+    volumes:
+      - ./data:/data
+      - ./src:/app/src        # edit code on the host, restart the container
+    depends_on:
+      mosquitto:
+        condition: service_healthy
+    restart: unless-stopped
+
+  stream-ingestor:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.pipeline
+    container_name: medallion-ingestor
+    <<: *run-as
+    environment:
+      <<: *pipeline-env
+      STREAM_BATCH_SIZE: "200"      # flush after N messages ...
+      STREAM_FLUSH_SECONDS: "30"    # ... or after N seconds, whichever comes first
+    command: ["python", "-m", "pipeline.sources.mqtt_stream"]
+    volumes:
+      - ./data:/data
+      - ./src:/app/src
+    depends_on:
+      mosquitto:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # -------------------------------------------------------------------------
+  # ORCHESTRATION
+  # -------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: medallion-postgres
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow      # local-only credentials; use secrets in prod
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  airflow-init:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.airflow
+    container_name: medallion-airflow-init
+    <<: *run-as
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment: &airflow-env
+      <<: *pipeline-env
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+      # LocalExecutor runs tasks as subprocesses of the scheduler: enough
+      # parallelism to be realistic, none of the Celery/Redis moving parts.
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+      AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
+      # Deterministic key so the webserver and scheduler agree across restarts.
+      AIRFLOW__WEBSERVER__SECRET_KEY: local-dev-not-a-secret
+      AIRFLOW__CORE__FERNET_KEY: ""
+      PYTHONPATH: /opt/airflow/src
+    volumes: &airflow-volumes
+      - ./airflow/dags:/opt/airflow/dags
+      - ./src:/opt/airflow/src            # the pipeline package the DAGs import
+      - ./data:/data                      # the shared lake + warehouse
+      - airflow-logs:/opt/airflow/logs
+    # One-shot: migrate the metadata DB, then create the login user.
+    command:
+      - bash
+      - -c
+      - |
+        airflow db migrate
+        airflow users create \
+          --username airflow --password airflow \
+          --firstname Data --lastname Engineer \
+          --role Admin --email admin@example.com || true
+
+  airflow-scheduler:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.airflow
+    container_name: medallion-airflow-scheduler
+    <<: *run-as
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    environment: *airflow-env
+    volumes: *airflow-volumes
+    command: ["airflow", "scheduler"]
+    restart: unless-stopped
+
+  airflow-webserver:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.airflow
+    container_name: medallion-airflow-webserver
+    <<: *run-as
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    environment: *airflow-env
+    volumes: *airflow-volumes
+    ports:
+      - "8080:8080"          # http://localhost:8080  (airflow / airflow)
+    command: ["airflow", "webserver"]
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+    restart: unless-stopped
+
+  # -------------------------------------------------------------------------
+  # SERVING
+  # -------------------------------------------------------------------------
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+    container_name: medallion-api
+    <<: *run-as
+    environment: *pipeline-env
+    ports:
+      - "8000:8000"          # http://localhost:8000/docs
+    volumes:
+      - ./data:/data
+      - ./src:/app/src
+      - ./services/api:/app/services/api
+    depends_on:
+      mosquitto:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.dashboard
+    container_name: medallion-dashboard
+    <<: *run-as
+    environment:
+      <<: *pipeline-env
+      API_BASE: http://api:8000
+    ports:
+      - "8501:8501"          # http://localhost:8501
+    volumes:
+      - ./data:/data
+      - ./src:/app/src
+      - ./services/dashboard:/app/services/dashboard
+    depends_on:
+      - api
+    restart: unless-stopped
+
+  # -------------------------------------------------------------------------
+  # UTILITY -- not started by `docker compose up` (it sits behind a profile).
+  # Use it for one-off runs:
+  #   docker compose run --rm pipeline python -m pipeline.demo --generate
+  # -------------------------------------------------------------------------
+  pipeline:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.pipeline
+    <<: *run-as
+    profiles: ["tools"]
+    environment: *pipeline-env
+    volumes:
+      - ./data:/data
+      - ./src:/app/src
+    depends_on:
+      - mosquitto
+
+volumes:
+  postgres-data:
+  airflow-logs:
+  mosquitto-data:

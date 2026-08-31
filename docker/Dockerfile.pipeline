@@ -1,0 +1,27 @@
+# Base image for the pure-Python pipeline components:
+#   * stream-ingestor  (MQTT -> landing zone)
+#   * simulator        (generates demo events and log files)
+#   * pipeline         (one-shot runs: `python -m pipeline.demo`)
+FROM python:3.11-slim
+
+# PYTHONUNBUFFERED keeps logs flowing to `docker compose logs` in real time
+# instead of sitting in a buffer; PYTHONDONTWRITEBYTECODE avoids root-owned
+# __pycache__ dirs appearing in the bind-mounted source tree.
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/app/src \
+    HOME=/tmp
+
+WORKDIR /app
+
+# Copy requirements first: this layer is cached until the pins actually change,
+# so editing pipeline code does not trigger a re-install of every dependency.
+COPY requirements/ requirements/
+# dev.txt includes pipeline.txt plus pytest, so `make test` works in this image.
+RUN pip install --no-cache-dir -r requirements/dev.txt
+
+COPY src/ src/
+COPY tests/ tests/
+
+# Default command; every service in docker-compose overrides it.
+CMD ["python", "-m", "pipeline.demo"]

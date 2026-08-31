@@ -1,0 +1,5 @@
+# FastAPI serving layer.  Reads the gold Parquet exports; never opens the warehouse.
+-r pipeline.txt
+fastapi==0.141.1
+uvicorn[standard]==0.52.4
+pydantic==2.12.4
